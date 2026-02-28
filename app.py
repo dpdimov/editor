@@ -171,9 +171,14 @@ tool = st.sidebar.radio(
     ["🔍 Reviewer Finder", "🌐 Topic Explorer", "📊 Board Overview"],
 )
 
-api_key = st.sidebar.text_input("Semantic Scholar API Key",
-                                type="password",
-                                help="Needed for Topic Explorer. Speeds up all API calls.")
+_secrets_key = st.secrets.get("S2_API_KEY", "") if hasattr(st, "secrets") else ""
+if _secrets_key:
+    api_key = _secrets_key
+    st.sidebar.success("S2 API key loaded from secrets")
+else:
+    api_key = st.sidebar.text_input("Semantic Scholar API Key",
+                                    type="password",
+                                    help="Needed for Topic Explorer. Speeds up all API calls.")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown(
