@@ -10,6 +10,7 @@ Requirements:
     pip install streamlit pandas openpyxl scikit-learn requests plotly
 """
 
+import io
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -200,7 +201,7 @@ except FileNotFoundError:
 st.sidebar.title("📚 ERB Editorial Tools")
 tool = st.sidebar.radio(
     "Select tool:",
-    ["🔍 Reviewer Finder", "🌐 Topic Explorer", "📊 Board Overview"],
+    ["🔍 Reviewer Finder", "🌐 Topic Explorer", "📊 Board Overview", "📂 Broader Pool"],
 )
 
 try:
@@ -913,4 +914,123 @@ elif tool == "📊 Board Overview":
         c_df = pd.DataFrame(country_counts, columns=["Country", "Count"])
         fig2 = px.pie(c_df, values="Count", names="Country",
                       title="Board members by country")
+        st.plotly_chart(fig2, use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# TOOL 4: BROADER POOL
+# ══════════════════════════════════════════════════════════════════════════
+elif tool == "📂 Broader Pool":
+    st.title("📂 Broader Reviewer Pool")
+
+    if not scopus_loaded:
+        st.error(f"Scopus file `{SCOPUS_FILE}` not found. Place it in the same directory as this app.")
+        st.stop()
+
+    # ── Stats row ─────────────────────────────────────────────────────────
+    stat_cols = st.columns(4)
+    pool_stats = [
+        (f"{len(scopus_df):,}", "Total Reviewers"),
+        (f"{int((scopus_df['Total_Pubs'] >= 3).sum()):,}" if "Total_Pubs" in scopus_df.columns else "—", "3+ Pubs"),
+        (f"{int((scopus_df['Total_Pubs'] >= 5).sum()):,}" if "Total_Pubs" in scopus_df.columns else "—", "5+ Pubs"),
+        (f"{int(scopus_df['Total_Citations'].sum()):,}" if "Total_Citations" in scopus_df.columns else "—", "Total Citations"),
+    ]
+    for col, (number, label) in zip(stat_cols, pool_stats):
+        col.metric(label, number)
+
+    st.markdown("")
+
+    # ── Search / filter controls ──────────────────────────────────────────
+    c1, c2 = st.columns(2)
+    name_q = c1.text_input("🔎 Search by name", placeholder="Type a name...", key="bp_name")
+    kw_q = c2.text_input("🔎 Search by keyword", placeholder="Type a keyword...", key="bp_kw")
+
+    journal_pub_cols = sorted([c for c in scopus_df.columns if c.startswith("Pubs_")])
+    journal_abbrevs = [c.replace("Pubs_", "") for c in journal_pub_cols]
+
+    if journal_pub_cols:
+        bp_journals = st.multiselect(
+            "Filter by journal (reviewer has ≥ 1 pub in selected journals)",
+            options=journal_abbrevs,
+            default=[],
+            key="bp_journals",
+        )
+    else:
+        bp_journals = []
+
+    browse = scopus_df.copy()
+    if name_q:
+        browse = browse[browse["Name"].str.lower().str.contains(name_q.lower(), na=False)]
+    if kw_q:
+        browse = browse[
+            browse["Keywords"].str.lower().str.contains(kw_q.lower(), na=False)
+            | browse["Areas_of_Expertise"].str.lower().str.contains(kw_q.lower(), na=False)
+        ]
+    for j in bp_journals:
+        col_name = f"Pubs_{j}"
+        if col_name in browse.columns:
+            browse = browse[browse[col_name] >= 1]
+
+    # ── Build display columns dynamically ─────────────────────────────────
+    core_cols = ["Name", "Location", "Areas_of_Expertise", "Total_Pubs",
+                 "Total_Citations", "Avg_Citations", "First_Year", "Last_Year"]
+    extra_cols = ["Is_ERB"]
+    show_cols = [c for c in core_cols if c in browse.columns]
+    show_cols += journal_pub_cols
+    show_cols += [c for c in extra_cols if c in browse.columns]
+
+    col_config = {
+        "Name": st.column_config.TextColumn("Name", width="medium"),
+        "Location": st.column_config.TextColumn("Affiliation", width="large"),
+        "Areas_of_Expertise": st.column_config.TextColumn("Expertise", width="large"),
+        "Total_Pubs": st.column_config.NumberColumn("Pubs", format="%d"),
+        "Total_Citations": st.column_config.NumberColumn("Citations", format="%d"),
+        "Avg_Citations": st.column_config.NumberColumn("Avg Cit.", format="%.1f"),
+        "First_Year": st.column_config.NumberColumn("First Yr", format="%d"),
+        "Last_Year": st.column_config.NumberColumn("Last Yr", format="%d"),
+        "Is_ERB": st.column_config.CheckboxColumn("ERB", default=False),
+    }
+    for jcol in journal_pub_cols:
+        abbrev = jcol.replace("Pubs_", "")
+        col_config[jcol] = st.column_config.NumberColumn(abbrev, format="%d")
+
+    st.dataframe(browse[show_cols].head(500), use_container_width=True, hide_index=True,
+                 column_config=col_config)
+    if len(browse) > 500:
+        st.caption(f"Showing 500 of {len(browse):,} reviewers. Use search/filters to narrow down.")
+
+    buf = io.BytesIO()
+    browse.drop(columns=["_profile"], errors="ignore").to_excel(buf, index=False)
+    st.download_button("📥 Download filtered database", buf.getvalue(), "broader_pool.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # ── Expertise chart ───────────────────────────────────────────────────
+    st.markdown("### Most common expertise areas")
+    all_keywords = []
+    for kw in scopus_df["Keywords"].dropna():
+        all_keywords.extend([k.strip().lower() for k in str(kw).split(",") if k.strip()])
+    kw_counts = Counter(all_keywords).most_common(30)
+    if kw_counts:
+        import plotly.express as px
+        kw_df = pd.DataFrame(kw_counts, columns=["Keyword", "Count"])
+        kw_df = kw_df.sort_values("Count", ascending=True)
+        fig = px.bar(kw_df, x="Count", y="Keyword", orientation="h",
+                     title="Broader pool expertise concentration",
+                     height=max(400, len(kw_df) * 25))
+        fig.update_layout(yaxis=dict(dtick=1))
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ── Geographic distribution ───────────────────────────────────────────
+    st.markdown("### Geographic distribution")
+    countries = []
+    for loc in scopus_df["Location"].dropna():
+        parts = str(loc).split(",")
+        country = parts[-1].strip() if parts else "Unknown"
+        countries.append(country)
+    country_counts = Counter(countries).most_common(20)
+    if country_counts:
+        import plotly.express as px
+        c_df = pd.DataFrame(country_counts, columns=["Country", "Count"])
+        fig2 = px.pie(c_df, values="Count", names="Country",
+                      title="Broader pool by country")
         st.plotly_chart(fig2, use_container_width=True)
