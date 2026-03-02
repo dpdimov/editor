@@ -31,7 +31,13 @@ st.set_page_config(
 
 # ── Constants ──────────────────────────────────────────────────────────────
 BOARD_FILE = "ERB_ETP_enriched.xlsx"  # Change to your enriched file path
+SCOPUS_FILE = "scopus_reviewer_database.xlsx"
 S2_BASE = "https://api.semanticscholar.org/graph/v1"
+JOURNAL_COLS = [
+    "Pubs_ERD", "Pubs_ETP", "Pubs_FBR", "Pubs_IJEBR", "Pubs_ISBJ",
+    "Pubs_JBV", "Pubs_JBVI", "Pubs_JSBM", "Pubs_SBE", "Pubs_SEJ", "Pubs_VC",
+]
+JOURNAL_ABBREVS = [c.replace("Pubs_", "") for c in JOURNAL_COLS]
 
 # ── Data loading (cached) ─────────────────────────────────────────────────
 @st.cache_data
@@ -60,6 +66,23 @@ def build_index(profiles: tuple):
     return vectorizer, matrix
 
 
+@st.cache_data
+def load_scopus(path: str, erb_names: set) -> pd.DataFrame:
+    df = pd.read_excel(path)
+    profiles = []
+    for _, row in df.iterrows():
+        parts = []
+        for col, weight in [("Areas_of_Expertise", 2), ("Keywords", 2),
+                            ("Recent_Titles", 1)]:
+            val = str(row.get(col, ""))
+            if val and val != "nan":
+                parts.extend([val] * weight)
+        profiles.append(" ".join(parts).lower())
+    df["_profile"] = profiles
+    df["Is_ERB"] = df["Name"].str.lower().str.strip().isin(erb_names)
+    return df
+
+
 def find_reviewers(query: str, df, vectorizer, matrix, top_n=10, exclude=None):
     scores = cosine_similarity(
         vectorizer.transform([query.lower()]), matrix
@@ -85,6 +108,7 @@ def s2_search_papers(query: str, year_from: int = None, year_to: int = None,
         "query": query,
         "limit": min(limit, 100),
         "fields": "title,abstract,year,citationCount,authors,journal,fieldsOfStudy",
+        "fieldsOfStudy": "Business",
     }
     if year_from or year_to:
         params["year"] = f"{year_from or ''}-{year_to or ''}"
@@ -164,6 +188,14 @@ try:
 except FileNotFoundError:
     board_loaded = False
 
+try:
+    erb_names_lower = set(df["Name"].str.lower().str.strip()) if board_loaded else set()
+    scopus_df = load_scopus(SCOPUS_FILE, frozenset(erb_names_lower))
+    scopus_vec, scopus_matrix = build_index(tuple(scopus_df["_profile"].tolist()))
+    scopus_loaded = True
+except FileNotFoundError:
+    scopus_loaded = False
+
 # ── Sidebar ────────────────────────────────────────────────────────────────
 st.sidebar.title("📚 ERB Editorial Tools")
 tool = st.sidebar.radio(
@@ -171,7 +203,10 @@ tool = st.sidebar.radio(
     ["🔍 Reviewer Finder", "🌐 Topic Explorer", "📊 Board Overview"],
 )
 
-_secrets_key = st.secrets.get("S2_API_KEY", "") if hasattr(st, "secrets") else ""
+try:
+    _secrets_key = st.secrets.get("S2_API_KEY", "")
+except Exception:
+    _secrets_key = ""
 if _secrets_key:
     api_key = _secrets_key
     st.sidebar.success("S2 API key loaded from secrets")
@@ -182,17 +217,20 @@ else:
 
 st.sidebar.markdown("---")
 st.sidebar.markdown(
-    "**Board members loaded:** "
+    "**ERB members:** "
     + (f"{len(df)}" if board_loaded else "❌ File not found")
 )
-st.sidebar.markdown(f"**Data file:** `{BOARD_FILE}`")
+st.sidebar.markdown(
+    "**Broader pool:** "
+    + (f"{len(scopus_df):,} reviewers" if scopus_loaded else "not loaded")
+)
 
 # ══════════════════════════════════════════════════════════════════════════
 # TOOL 1: REVIEWER FINDER
 # ══════════════════════════════════════════════════════════════════════════
 if tool == "🔍 Reviewer Finder":
     st.title("🔍 Reviewer Finder")
-    st.markdown("Paste a paper's abstract and keywords to find the best-matched editorial board members.")
+    st.markdown("Paste a paper's abstract and keywords to find the best-matched reviewers.")
 
     if not board_loaded:
         st.error(f"Board file `{BOARD_FILE}` not found. Place it in the same directory as this app.")
@@ -213,22 +251,33 @@ if tool == "🔍 Reviewer Finder":
                                     placeholder="e.g. author names to exclude\n(paper authors, conflicted reviewers)")
         exclude_names = [n.strip() for n in exclude_text.strip().split("\n") if n.strip()] if exclude_text else None
 
+        if scopus_loaded:
+            st.caption("Broader pool filters")
+            selected_journals = st.multiselect(
+                "Require pubs in journals",
+                options=JOURNAL_ABBREVS,
+                default=[],
+                help="Only show broader-pool reviewers with ≥ min pubs in each selected journal",
+            )
+            min_pubs = st.slider("Minimum publications", 1, 20, 1, key="min_pubs")
+
     if st.button("🔎 Find Reviewers", type="primary", use_container_width=True):
         if not abstract.strip():
             st.warning("Please paste an abstract.")
         else:
             query = f"{abstract} {keywords} {keywords} {keywords}"
-            results = find_reviewers(query, df, vectorizer, tfidf_matrix,
-                                     top_n=top_n, exclude=exclude_names)
 
-            if results.empty:
-                st.info("No strong matches found. Try broadening your keywords.")
+            # ── Section A: ERB Board Members ──────────────────────────────
+            erb_results = find_reviewers(query, df, vectorizer, tfidf_matrix,
+                                         top_n=top_n, exclude=exclude_names)
+
+            st.markdown("### ERB Board Members")
+            if erb_results.empty:
+                st.info("No strong ERB matches found.")
             else:
-                st.markdown(f"### Top {len(results)} matches")
-
-                for rank, (_, row) in enumerate(results.iterrows(), 1):
+                st.caption(f"Top {len(erb_results)} matches from the editorial board")
+                for rank, (_, row) in enumerate(erb_results.iterrows(), 1):
                     score = row["Relevance"]
-
                     with st.container():
                         c1, c2 = st.columns([3, 1])
                         with c1:
@@ -242,9 +291,87 @@ if tool == "🔍 Reviewer Finder":
                             st.progress(min(score * 3, 1.0))
                         st.divider()
 
-                csv = results[["Name", "Location", "Areas_of_Expertise",
-                               "Keywords", "Relevance"]].to_csv(index=False)
-                st.download_button("📥 Download results as CSV", csv,
+            # ── Section B: Broader Reviewer Pool ──────────────────────────
+            broader_results = pd.DataFrame()
+            if scopus_loaded:
+                st.markdown("### Broader Reviewer Pool")
+                broader_results = find_reviewers(
+                    query, scopus_df, scopus_vec, scopus_matrix,
+                    top_n=top_n * 3, exclude=exclude_names,
+                )
+                if not broader_results.empty:
+                    # Exclude names already shown in ERB section
+                    erb_shown = set(erb_results["Name"].str.lower().str.strip()) if not erb_results.empty else set()
+                    broader_results = broader_results[
+                        ~broader_results["Name"].str.lower().str.strip().isin(erb_shown)
+                    ]
+                    # Apply journal filters
+                    for j in (selected_journals if scopus_loaded else []):
+                        col_name = f"Pubs_{j}"
+                        if col_name in broader_results.columns:
+                            broader_results = broader_results[broader_results[col_name] >= min_pubs]
+                    # Limit to top_n after filtering
+                    broader_results = broader_results.head(top_n)
+
+                if broader_results.empty:
+                    st.info("No broader-pool matches (try relaxing journal filters).")
+                else:
+                    st.caption(f"Top {len(broader_results)} matches from the broader Scopus pool")
+                    for rank, (_, row) in enumerate(broader_results.iterrows(), 1):
+                        score = row["Relevance"]
+                        name = str(row["Name"])
+                        location = str(row.get("Location", ""))
+                        if location == "nan":
+                            location = ""
+                        expertise = str(row.get("Areas_of_Expertise", ""))
+                        if expertise == "nan":
+                            expertise = ""
+                        erb_badge = " *(ERB)*" if row.get("Is_ERB", False) else ""
+
+                        # Journal breakdown — only non-zero journals
+                        journal_parts = []
+                        for jcol in JOURNAL_COLS:
+                            val = row.get(jcol, 0)
+                            if pd.notna(val) and int(val) > 0:
+                                journal_parts.append(f"{jcol.replace('Pubs_', '')}: {int(val)}")
+                        journal_str = " | ".join(journal_parts)
+
+                        with st.container():
+                            c1, c2 = st.columns([3, 1])
+                            with c1:
+                                st.markdown(f"**{rank}. {name}**{erb_badge}")
+                                if location:
+                                    st.caption(f"📍 {location}")
+                                if expertise:
+                                    st.markdown(f"*{expertise[:200]}*")
+                                pubs = row.get("Total_Pubs", 0)
+                                cites = row.get("Total_Citations", 0)
+                                if pd.notna(pubs) and pd.notna(cites):
+                                    st.caption(f"📊 {int(pubs)} pubs · {int(cites)} citations")
+                                if journal_str:
+                                    st.caption(f"📰 {journal_str}")
+                            with c2:
+                                st.metric("Score", f"{score:.3f}")
+                                st.progress(min(score * 3, 1.0))
+                            st.divider()
+
+            # ── Combined CSV download ─────────────────────────────────────
+            csv_parts = []
+            if not erb_results.empty:
+                erb_csv = erb_results[["Name", "Location", "Areas_of_Expertise",
+                                       "Keywords", "Relevance"]].copy()
+                erb_csv["Source"] = "ERB"
+                csv_parts.append(erb_csv)
+            if not broader_results.empty:
+                cols = ["Name", "Location", "Areas_of_Expertise", "Keywords", "Relevance"]
+                extra = ["Total_Pubs", "Total_Citations"] + JOURNAL_COLS
+                cols += [c for c in extra if c in broader_results.columns]
+                bp_csv = broader_results[cols].copy()
+                bp_csv["Source"] = "Broader Pool"
+                csv_parts.append(bp_csv)
+            if csv_parts:
+                combined_csv = pd.concat(csv_parts, ignore_index=True).to_csv(index=False)
+                st.download_button("📥 Download all results as CSV", combined_csv,
                                    "reviewer_suggestions.csv", "text/csv")
 
 
@@ -497,6 +624,7 @@ elif tool == "🌐 Topic Explorer":
                         "limit": 100,
                         "fields": "title,year,citationCount,authors,journal,externalIds",
                         "sort": "citationCount:desc",
+                        "fieldsOfStudy": "Business",
                     }
                     try:
                         r = requests.get(f"{S2_BASE}/paper/search", params=params,
